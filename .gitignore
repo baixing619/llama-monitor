@@ -1,0 +1,12 @@
+# Local build outputs and diagnostics
+dist/
+monitor-diag.log
+build.rsp
+
+# Editor and temporary files
+.vs/
+.vscode/
+*.user
+*.suo
+*.tmp
+*.bak
