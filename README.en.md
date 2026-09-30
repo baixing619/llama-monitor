@@ -6,6 +6,8 @@ LlamaMonitor is a small Windows desktop window that shows what a local LLM infer
 
 It reads server status without changing server configuration, sending inference requests, or modifying model files. It may write a local `monitor-diag.log` file for diagnostics.
 
+**v0.2.0** adds service uptime, a floating Mini window, and log refresh that preserves your reading position. It also corrects the calculation of retained slot tokens.
+
 ## Requirements
 
 - Windows 10 version 1809 or later, or Windows 11; x64. ARM64 can run it through x64 emulation. Older Windows versions have not been tested.
@@ -26,7 +28,7 @@ LlamaMonitor discovers local backends by inspecting relevant processes and their
 
 | Backend | Typical port | Available data |
 |---|---:|---|
-| llama.cpp (`llama-server`) | 8080 | Slot details, prompt progress, cache hit rate, per-slot speed, KV pool, task timing, logs |
+| llama.cpp (`llama-server`) | 8080 | Retained slot tokens/limits, prefill/cache/output counts, per-slot speed, KV pool, task timing, logs |
 | Ollama | 11434 | Model list and availability |
 | LM Studio | 1234 | Model list and availability |
 | vLLM | 8000 | Model list and cumulative generation metrics |
@@ -41,13 +43,18 @@ Only backends with a compatible `/slots` endpoint provide slot-level data. The s
 ## Window contents
 
 - **Header:** connection status, server address, discovery source, model, slot count, build, and selected log.
+- **Service uptime:** time since the actual local listening process started, when its start time is available. Otherwise, including remote services, the label explicitly says **Observed online**: the time the monitor has continuously observed the service online, rather than its total lifetime. Offline data is cleared, and the source is checked again after reconnection or a service change.
 - **GPU row:** utilization, power, temperature, and VRAM for NVIDIA GPUs when `nvidia-smi` is available.
-- **Live slots:** task state, prompt progress and cache hit rate, generated tokens, current and recent speed, and context usage from `/slots`.
+- **Live slots:** task state, prefill/cache/output counts, current and recent speed, and retained slot tokens/limit from `/slots`.
 - **Recent tasks:** generation speed, recent speed, draft acceptance, prefill progress, and last update parsed from server logs. The table keeps recent task data for up to ten minutes.
 - **KV pool:** usage, safety margin, output reserve, and policy when the server exposes `kv_budget_guard`.
-- **Log tail:** recent raw server log lines. Warning and error counts appear in the status bar.
+- **Log tail:** recent raw server log lines. New lines follow automatically while you are at the bottom. Scrolling up preserves the reading position and selection during refresh; **Latest** returns to the bottom and resumes following. Warning and error counts appear in the status bar.
 
-Buttons: **Topmost** keeps the window on top; **Pause** stops refreshing; **Open log** opens the current log in Notepad or its directory in Explorer; **WebUI** opens the server's UI at the configured UI port (by default the server port plus one); **EN / 中文** switches language. Press `Esc` to close the window.
+Slot usage is the token sequence currently retained in a slot, divided by `n_ctx`; a usage percentage is shown when the limit is known. The monitor uses `n_past` when available, otherwise `n_prompt_tokens`. In current llama.cpp, `n_prompt_tokens` already includes generated tokens, so adding the generated count again would double-count them. An idle slot may still retain context. Missing counts or limits display `—`; prefill percentages and cache hit rates are not inferred from these fields. Generated counts support both the top-level field and `next_token.n_decoded`. Generation speed displays `—` when the slot is idle or the generated count is unknown. Offline services do not retain stale slot data in the window.
+
+Buttons: **Topmost** keeps the window on top; **Pause** stops refreshing; **View log** opens the current log in Notepad or its directory in Explorer; **WebUI** opens the server's UI at the configured UI port (by default the server port plus one); **EN / 中文** switches language; **Mini** opens the floating view; **Latest** jumps to the newest log lines. Press `Esc` to close the full window.
+
+The **Mini window** is resizable and shares the full monitor's data refresh. It shows connection status, uptime, compact GPU information, and scrollable slot cards with token usage/limit, generated tokens, cached tokens, and current speed. Backends without slot data show an explicit message. Use the native title bar to drag the window, **Full** to restore the full view, **Pause** to pause or resume shared refresh, **EN / 中文** to switch language, and **Pin** to control Mini's always-on-top setting. Double-clicking the service title inside Mini also restores the full view. Closing Mini with its **X exits the entire monitor**. Start directly in Mini with `--mini`.
 
 ## Command-line options
 
@@ -63,6 +70,7 @@ All options are optional. Without them, LlamaMonitor attempts automatic discover
 | `--interval N` | `1000` ms | Refresh interval; minimum 200 ms |
 | `--pid N` | None | Target a specific process |
 | `--no-topmost` | Off | Do not start always on top |
+| `--mini` | Off | Start in the floating Mini window |
 | `--list` | Off | List discovered services without opening a window |
 | `--lang en` / `--lang zh` | Windows UI language | Select output and interface language |
 
@@ -73,6 +81,7 @@ LlamaMonitor.exe
 LlamaMonitor-cli.exe --list
 LlamaMonitor.exe --port 8080 --lang en
 LlamaMonitor.exe --interval 500 --no-topmost
+LlamaMonitor.exe --mini
 ```
 
 If no service is found, try `LlamaMonitor-cli.exe --list`. Automatic port probes include 8080, 11434, 1234, 8000, 30000, 5001, 5000, 1235, and 8081. For a different port, use `--port N`.
@@ -81,8 +90,17 @@ If GPU output is missing, check whether an NVIDIA driver is installed and `nvidi
 
 ## Build from source
 
-The source is C# WinForms targeting .NET Framework 4.x. On a supported Windows installation with the framework's C# compiler, run `build.cmd` in the project root. The script compiles all four `src/*.cs` files and writes `dist\LlamaMonitor.exe` (desktop) and `dist\LlamaMonitor-cli.exe` (console). Use the console build with `--list` to pipe discovery output into a script. It uses the system framework compiler; no .NET SDK is needed. If that compiler is unavailable on a customized system, install or enable .NET Framework 4.x before rebuilding.
+The source is C# 5 WinForms targeting .NET Framework 4.x. On a supported Windows installation with the framework's C# compiler, run `build.cmd` in the project root. The script compiles all eight `src/*.cs` files and writes `dist\LlamaMonitor.exe` (desktop) and `dist\LlamaMonitor-cli.exe` (console). The first argument selects a different output directory:
 
-## License and roadmap
+```text
+build.cmd
+build.cmd "release-build"
+```
 
-Licensed under [MIT](LICENSE). A floating Mini window is planned for a later version; it is not included in this release.
+The source repository ignores generated `dist` contents. Use the console build with `--list` to pipe discovery output into a script. Building uses the system framework compiler; no .NET SDK is needed. If that compiler is unavailable on a customized system, install or enable .NET Framework 4.x before rebuilding.
+
+Run `test.cmd` for checks using local server and log fixtures. These cover token fields, uptime sources, log reading position, and the full/Mini windows in both languages. The test executable and rendered window artifacts are written under `dist\tests`. Fixture checks do not replace validation against a real inference service, another computer, or human visual review.
+
+## License
+
+Licensed under [MIT](LICENSE).

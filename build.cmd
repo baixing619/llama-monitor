@@ -4,6 +4,7 @@ setlocal
 rem Build with the .NET Framework C# compiler included with supported Windows versions.
 set "ROOT=%~dp0"
 set "OUTDIR=%ROOT%dist"
+if not "%~1"=="" set "OUTDIR=%~1"
 set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 set "REFDIR=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319"
 
@@ -30,7 +31,11 @@ if errorlevel 1 exit /b 1
   "%ROOT%src\LlamaMonitor.cs" ^
   "%ROOT%src\ServerDiscovery.cs" ^
   "%ROOT%src\NativeCommandLine.cs" ^
-  "%ROOT%src\Backends.cs"
+  "%ROOT%src\Backends.cs" ^
+  "%ROOT%src\ServiceRuntime.cs" ^
+  "%ROOT%src\SlotMetrics.cs" ^
+  "%ROOT%src\LogTailTextBox.cs" ^
+  "%ROOT%src\MiniMonitorForm.cs"
 
 if errorlevel 1 (
   echo [build] Compilation failed.
@@ -48,7 +53,11 @@ rem A console-subsystem build keeps --list usable from a terminal or scripts.
   "%ROOT%src\LlamaMonitor.cs" ^
   "%ROOT%src\ServerDiscovery.cs" ^
   "%ROOT%src\NativeCommandLine.cs" ^
-  "%ROOT%src\Backends.cs"
+  "%ROOT%src\Backends.cs" ^
+  "%ROOT%src\ServiceRuntime.cs" ^
+  "%ROOT%src\SlotMetrics.cs" ^
+  "%ROOT%src\LogTailTextBox.cs" ^
+  "%ROOT%src\MiniMonitorForm.cs"
 
 if errorlevel 1 (
   echo [build] Console compilation failed.
