@@ -179,6 +179,10 @@ namespace LlamaMonitor
                         Check(new[] { "_btnPause", "_btnLog", "_btnWeb", "_btnLanguage", "_btnMini", "_btnLatest" }.All(name => { var button = (Button)Field(form, name); return TextRenderer.MeasureText(button.Text, button.Font).Width + 8 <= button.ClientSize.Width; }), "full buttons fit both languages and display DPI " + language);
                         var latestButton = (Button)Field(form, "_btnLatest");
                         Check(latestButton.ClientSize.Height >= TextRenderer.MeasureText(latestButton.Text, latestButton.Font).Height + 6, "latest button text is not vertically clipped " + language);
+                        tail.Select(0, 0);
+                        SendMessage(tail.Handle, 0xB6, IntPtr.Zero, new IntPtr(-FirstLine(tail)));
+                        latestButton.PerformClick();
+                        Check(tail.SelectionStart == tail.TextLength && FirstLine(tail) > 80, "the full-view Latest button actually jumps to the newest log " + language);
 
                         Call(form, "TogglePause");
                         int requests = server.RequestCount;
