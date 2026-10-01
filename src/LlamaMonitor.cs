@@ -52,8 +52,12 @@ namespace LlamaMonitor
             { "ViewLog", new[] { "看日志", "View log" } },
             { "WebUI", new[] { "WebUI", "Web UI" } },
             { "LanguageSwitch", new[] { "EN", "中文" } },
+            { "Mini", new[] { "Mini 浮窗", "Mini" } },
+            { "Latest", new[] { "到底部", "Latest" } },
+            { "ServiceUptime", new[] { "连续运行 {0}", "Service uptime {0}" } },
+            { "ObservedUptime", new[] { "观察在线 {0}", "Observed online {0}" } },
             { "SlotSection", new[] { "槽位实时（llama.cpp /slots；其它后端不提供此数据）", "Live slots (llama.cpp /slots; unavailable for other backends)" } },
-            { "SlotHeader", new[] { "槽|任务|状态|提示词进度|提示词用量（含缓存命中）|已生成|当前速度|近三秒|上下文占用", "Slot|Task|State|Prompt progress|Prompt tokens (incl. cache)|Generated|Current tok/s|Last 3 s|Context usage" } },
+            { "SlotHeader", new[] { "槽|任务|状态|已预填充 token|缓存 token|输出 token|当前速度|近三秒|槽 token 用量 / 上限", "Slot|Task|State|Prefill tokens|Cached tokens|Output tokens|Current tok/s|Last 3 s|Slot tokens / limit" } },
             { "TaskSection", new[] { "各任务时刻（来自服务日志，保留最近 10 分钟）", "Task timings (from server log; last 10 minutes)" } },
             { "TaskHeader", new[] { "槽|已生成数|生成速度|近三秒速度|草稿接受率|预填充进度|最后更新", "Slot|Tokens generated|Generation speed|Last 3 s speed|Draft acceptance|Prefill progress|Last update" } },
             { "LogSection", new[] { "服务日志尾巴（警告统计在底部状态栏）", "Server log tail (warning counts shown in status bar)" } },
@@ -227,6 +231,7 @@ namespace LlamaMonitor
         public int LogMs = 1200;
         public bool TopMost = true;
         public bool ListOnly;
+        public bool StartMini;
         public int ExplicitPid;          // 0 = 不指定
         public string UiLanguage = "";   // empty = follow Windows UI language
         public int RequestedPort;         // preserve the command-line choice after discovery updates Port
@@ -261,6 +266,7 @@ namespace LlamaMonitor
                         break;
                     case "-notopmost": case "--no-topmost": c.TopMost = false; break;
                     case "-list": case "--list": c.ListOnly = true; break;
+                    case "-mini": case "--mini": c.StartMini = true; break;
                 }
             }
             return c;
@@ -277,6 +283,7 @@ namespace LlamaMonitor
                     Port = RequestedPort > 0 ? RequestedPort : 8080,
                     DiscoveryKind = "command"
                 };
+                LocalProcessResolver.Attach(target);
                 found = Backends.Probe(target, timeoutMs)
                     ? new List<BackendTarget> { target } : new List<BackendTarget>();
             }
@@ -431,17 +438,20 @@ namespace LlamaMonitor
         private readonly MonitorConfig _cfg;
         private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
 
-        private Label _lblTitle, _lblSub, _lblGpu, _lblKv, _lblStatus;
+        private Label _lblTitle, _lblSub, _lblGpu, _lblKv, _lblStatus, _lblRuntime;
         private Label _lblSlotHdr, _lblTimeHdr, _lblTailHdr;
         private CheckBox _chkTop;
-        private Button _btnPause, _btnLog, _btnWeb, _btnLanguage;
+        private Button _btnPause, _btnLog, _btnWeb, _btnLanguage, _btnMini, _btnLatest;
         private DataGridView _gridSlot, _gridTime;
-        private TextBox _txtTail;
+        private LogTailTextBox _txtTail;
         private BufferedPanel _root;
         private Dictionary<int, float> _rowDefaults = new Dictionary<int, float>();
         private bool _hasKvGuard;
 
-        private System.Windows.Forms.Timer _timer, _gpuTimer, _logTimer;
+        private System.Windows.Forms.Timer _timer, _gpuTimer, _logTimer, _runtimeTimer;
+        private readonly ServiceRuntime _runtime = new ServiceRuntime();
+        private MiniMonitorForm _mini;
+        private bool _serviceOnline, _closing, _resetLogView = true;
         private NoEraseWindow _noEraseSlot, _noEraseTime;
 
         private bool _paused;
@@ -474,6 +484,7 @@ namespace LlamaMonitor
         {
             public DateTime T = DateTime.Now;
             public long N;
+            public long Task;
             public readonly Queue<Sample> Hist = new Queue<Sample>();
         }
 
@@ -622,6 +633,10 @@ namespace LlamaMonitor
             _logTimer.Tick += (s, e) => { try { ReadLogIncremental(); } catch (Exception ex) { Diag.Write("日志解析异常: " + ex); } };
             _logTimer.Start();
 
+            _runtimeTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+            _runtimeTimer.Tick += (s, e) => UpdateRuntimeView();
+            _runtimeTimer.Start();
+
             // 表格：开双缓冲 + 禁掉背景擦除（在窗体句柄建立后挂接）
             Load += (s, e) =>
             {
@@ -634,8 +649,11 @@ namespace LlamaMonitor
 
             FormClosing += (s, e) =>
             {
-                _timer.Stop(); _gpuTimer.Stop(); _logTimer.Stop();
+                _closing = true;
+                _timer.Stop(); _gpuTimer.Stop(); _logTimer.Stop(); _runtimeTimer.Stop();
+                if (_mini != null) _mini.Dispose();
             };
+            Shown += (s, e) => { if (_cfg.StartMini) BeginInvoke(new Action(ShowMini)); };
             KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) Close(); };
         }
 
@@ -821,7 +839,7 @@ namespace LlamaMonitor
                 Padding = new Padding(0)
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));   // 0  顶栏
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));   // 0  顶栏
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));   // 1  槽位标题
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));   // 2  槽位表
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));   // 3  任务标题
@@ -843,26 +861,28 @@ namespace LlamaMonitor
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
-                RowCount = 3,
+                RowCount = 4,
                 BackColor = CPanel,
                 Margin = new Padding(0),
                 Padding = new Padding(10, 4, 6, 4)
             };
             top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             top.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 356f));
-            for (int i = 0; i < 3; i++) top.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 0 ? 28 : 22));
+            for (int i = 0; i < 4; i++) top.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 0 ? 28 : 22));
             root.Controls.Add(top, 0, 0);
 
             _lblTitle = MakeLabel(UiText.T("Connecting"), FMonoB, CAccent);
             _lblSub = MakeLabel("", FMonoS, CDim);
             _lblGpu = MakeLabel("", FMono, CFg);
+            _lblRuntime = MakeLabel("", FMonoS, CAccent);
             top.Controls.Add(_lblTitle, 0, 0);
             top.Controls.Add(_lblSub, 0, 1);
             top.Controls.Add(_lblGpu, 0, 2);
+            top.Controls.Add(_lblRuntime, 0, 3);
 
             var btnHost = new Panel { Dock = DockStyle.Fill, BackColor = CPanel, Margin = new Padding(0) };
             top.Controls.Add(btnHost, 1, 0);
-            top.SetRowSpan(btnHost, 3);
+            top.SetRowSpan(btnHost, 4);
 
             _chkTop = new CheckBox
             {
@@ -872,26 +892,30 @@ namespace LlamaMonitor
                 BackColor = Color.Transparent,
                 Checked = _cfg.TopMost,
                 Location = new Point(0, 8),
-                Size = new Size(56, 24)
+                Size = new Size(Math.Max(56, TextRenderer.MeasureText("Topmost", FMonoS).Width + 24), 24)
             };
             _chkTop.CheckedChanged += (s, e) => TopMost = _chkTop.Checked;
             btnHost.Controls.Add(_chkTop);
 
-            _btnPause = MakeButton(UiText.T("Pause"), 62, btnHost);
-            _btnLog = MakeButton(UiText.T("ViewLog"), 146, btnHost);
-            _btnWeb = MakeButton(UiText.T("WebUI"), 230, btnHost);
-            _btnLanguage = MakeButton(UiText.T("LanguageSwitch"), 312, btnHost, 42);
-            _btnLanguage.Click += (s, e) =>
-            {
-                UiText.Toggle();
-                ApplyLocalizedUi();
-            };
+            int buttonX = _chkTop.Width + 10;
+            _btnPause = MakeButton(UiText.T("Pause"), buttonX, btnHost,
+                Math.Max(80, TextRenderer.MeasureText("Resume", FMonoS).Width + 16));
+            buttonX += _btnPause.Width + 4;
+            _btnLog = MakeButton(UiText.T("ViewLog"), buttonX, btnHost,
+                Math.Max(80, TextRenderer.MeasureText("View log", FMonoS).Width + 16));
+            buttonX += _btnLog.Width + 4;
+            _btnWeb = MakeButton(UiText.T("WebUI"), buttonX, btnHost,
+                Math.Max(80, TextRenderer.MeasureText("Web UI", FMonoS).Width + 16));
+            buttonX += _btnWeb.Width + 4;
+            _btnLanguage = MakeButton(UiText.T("LanguageSwitch"), buttonX, btnHost,
+                Math.Max(42, TextRenderer.MeasureText("中文", FMonoS).Width + 16));
+            top.ColumnStyles[1].Width = buttonX + _btnLanguage.Width + 2;
+            _btnLanguage.Click += (s, e) => ToggleLanguage();
+            _btnMini = MakeButton(UiText.T("Mini"), _btnLog.Left, btnHost, 100);
+            _btnMini.Top = 40;
+            _btnMini.Click += (s, e) => ShowMini();
 
-            _btnPause.Click += (s, e) =>
-            {
-                _paused = !_paused;
-                _btnPause.Text = UiText.T(_paused ? "Resume" : "Pause");
-            };
+            _btnPause.Click += (s, e) => TogglePause();
             _btnLog.Click += (s, e) =>
             {
                 try
@@ -942,8 +966,18 @@ namespace LlamaMonitor
 
             // ── 6/7 日志区 ──
             _lblTailHdr = MakeLabel(UiText.T("LogSection"), FMonoS, CDim);
-            root.Controls.Add(_lblTailHdr, 0, 6);
-            _txtTail = new TextBox
+            var logHeader = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0), BackColor = CBg };
+            _btnLatest = new Button { Text = UiText.T("Latest"), Dock = DockStyle.Right,
+                Width = 88, FlatStyle = FlatStyle.Flat, ForeColor = CAccent, BackColor = CBg,
+                Font = FMonoS, Margin = new Padding(0), Padding = new Padding(0) };
+            int logHeaderHeight = Math.Max(26, TextRenderer.MeasureText("Latest 到底部", FMonoS).Height + 8);
+            root.RowStyles[6].Height = logHeaderHeight;
+            _rowDefaults[6] = logHeaderHeight;
+            _btnLatest.Click += (s, e) => _txtTail.JumpToLatest();
+            logHeader.Controls.Add(_lblTailHdr);
+            logHeader.Controls.Add(_btnLatest);
+            root.Controls.Add(logHeader, 0, 6);
+            _txtTail = new LogTailTextBox
             {
                 Multiline = true,
                 ReadOnly = true,
@@ -1032,15 +1066,89 @@ namespace LlamaMonitor
             _btnLog.Text = UiText.T("ViewLog");
             _btnWeb.Text = UiText.T("WebUI");
             _btnLanguage.Text = UiText.T("LanguageSwitch");
+            _btnMini.Text = UiText.T("Mini");
+            _btnLatest.Text = UiText.T("Latest");
             _lblSlotHdr.Text = UiText.T("SlotSection");
             _lblTimeHdr.Text = UiText.T("TaskSection");
             _lblTailHdr.Text = UiText.T("LogSection");
             UpdateGridHeaders(_gridSlot, UiText.T("SlotHeader").Split(new[] { '|' }));
             UpdateGridHeaders(_gridTime, UiText.T("TaskHeader").Split(new[] { '|' }));
-            _lastSlots = null;
-            UpdateGpu();
             UpdateSubtitle();
-            SafeRefresh(true);
+            if (_paused)
+            {
+                RenderSlots(_lastSlots ?? new List<SlotRow>());
+                RenderTasks(DateTime.Now);
+                RenderKv(_lastSlots == null || _lastSlots.Any(s => s.NPast < 0)
+                    ? -1 : _lastSlots.Sum(s => s.NPast));
+            }
+            else
+            {
+                _lastSlots = null;
+                UpdateGpu();
+                SafeRefresh(true);
+            }
+            UpdateRuntimeView();
+        }
+
+        private void ToggleLanguage()
+        {
+            UiText.Toggle();
+            ApplyLocalizedUi();
+        }
+
+        private void TogglePause()
+        {
+            _paused = !_paused;
+            _btnPause.Text = UiText.T(_paused ? "Resume" : "Pause");
+            if (!_paused) SafeRefresh(true);
+            UpdateRuntimeView();
+        }
+
+        private void ShowMini()
+        {
+            if (_mini == null || _mini.IsDisposed)
+            {
+                _mini = new MiniMonitorForm(TopMost);
+                _mini.FullRequested += (s, e) => { _mini.Hide(); Show(); Activate(); };
+                _mini.ExitRequested += (s, e) => { if (!_closing) Close(); };
+                _mini.PauseRequested += (s, e) => TogglePause();
+                _mini.LanguageRequested += (s, e) => ToggleLanguage();
+            }
+            UpdateRuntimeView();
+            _mini.Show();
+            _mini.Activate();
+            Hide();
+        }
+
+        private void UpdateRuntimeView()
+        {
+            string uptime = _runtime.Display(DateTime.UtcNow);
+            SetText(_lblRuntime, uptime + (_paused ? UiText.T("PausedTag") : ""));
+            if (_mini != null && !_mini.IsDisposed)
+                _mini.UpdateSnapshot(new MiniSnapshot {
+                    Online = _serviceOnline, Paused = _paused, SupportsSlots = _showSlots,
+                    Service = (_picked != null ? _picked.KindName + " · " : "") + _cfg.BaseUrl,
+                    Uptime = uptime, Gpu = _gpuText,
+                    Slots = _lastSlots ?? new List<SlotRow>()
+                });
+        }
+
+        private void ObserveService(bool online)
+        {
+            bool changed = _runtime.Observe(_picked, online, DateTime.UtcNow);
+            if (changed || (!online && _serviceOnline))
+            {
+                _slotState.Clear();
+                _lastSlots = null;
+                _tasks.Clear();
+                _propsMissing = true;
+                _modelName = _buildInfo = _totalSlots = _lastSubtitle = "";
+                _kvGuard = null;
+                RenderSlots(new List<SlotRow>());
+                RenderTasks(DateTime.Now);
+                RenderKv(0);
+            }
+            _serviceOnline = online;
         }
 
         private static void UpdateGridHeaders(DataGridView grid, string[] headers)
@@ -1160,6 +1268,8 @@ namespace LlamaMonitor
             {
                 Diag.Write("刷新异常: " + ex);
                 SetText(_lblStatus, UiText.F("RefreshError", ex.Message));
+                ObserveService(false);
+                UpdateRuntimeView();
             }
         }
 
@@ -1175,6 +1285,7 @@ namespace LlamaMonitor
 
             if (!reachable)
             {
+                ObserveService(false);
                 SetText(_lblTitle, UiText.F("NoServer", _cfg.BaseUrl));
                 SetColor(_lblTitle, CBad);
                 SetText(_lblGpu, UiText.T("ServiceUnreachable"));
@@ -1189,8 +1300,11 @@ namespace LlamaMonitor
                     if (_target != null && _target.Alive)
                         SetText(_lblStatus, "[" + now.ToString("HH:mm:ss") + "] " + UiText.F("ServerFoundAgain", _target.Host, _target.Port));
                 }
+                UpdateRuntimeView();
                 return;
             }
+
+            ObserveService(true);
 
             if (!_showSlots)
             {
@@ -1201,6 +1315,7 @@ namespace LlamaMonitor
                 RenderTail(now);
                 _refreshed++;
                 UpdateRefreshStatus(now);
+                UpdateRuntimeView();
                 return;
             }
 
@@ -1245,7 +1360,8 @@ namespace LlamaMonitor
                     var s = item as Dictionary<string, object>;
                     if (s == null) continue;
                     var r = BuildSlotRow(s, now);
-                    ctxSum += r.NPast;
+                    if (r.NPast < 0) ctxSum = -1;
+                    else if (ctxSum >= 0) ctxSum += r.NPast;
                     rows.Add(r);
                 }
             }
@@ -1267,6 +1383,7 @@ namespace LlamaMonitor
 
             _refreshed++;
             UpdateRefreshStatus(now);
+            UpdateRuntimeView();
         }
 
         private void UpdateRefreshStatus(DateTime now)
@@ -1282,72 +1399,31 @@ namespace LlamaMonitor
 
         private SlotRow BuildSlotRow(Dictionary<string, object> s, DateTime now)
         {
-            var r = new SlotRow();
-            r.Id = (int)AsLong(s, "id");
-            r.Task = AsLong(s, "id_task");
-            object p;
-            s.TryGetValue("is_processing", out p);
-            r.Processing = p is bool && (bool)p;
-            r.PromptTotal = AsLong(s, "n_prompt_tokens");
-            r.PromptProcessed = AsLong(s, "n_prompt_tokens_processed");
-            r.PromptCache = AsLong(s, "n_prompt_tokens_cache");
-            r.NDecoded = AsLong(s, "n_decoded");
-            r.NCtx = AsLong(s, "n_ctx");
-
-            // /slots 并不提供 n_past：实际占用 = 提示词总长 + 已生成长度。
-            // （n_prompt_tokens_processed 只是本轮新算的部分，生成阶段会归零，不能用来算占用）
-            r.NPast = r.PromptTotal + r.NDecoded;
-
+            var r = SlotMetrics.Read(s);
             SlotState st;
-            if (!_slotState.TryGetValue(r.Id, out st))
+            if (!_slotState.TryGetValue(r.Id, out st) || st.Task != r.Task || st.N < 0 || r.NDecoded < st.N)
             {
-                st = new SlotState { T = now, N = r.NDecoded };
+                st = new SlotState { T = now, N = r.NDecoded, Task = r.Task };
                 _slotState[r.Id] = st;
             }
 
-            st.Hist.Enqueue(new Sample { T = now, N = r.NDecoded });
-            while (st.Hist.Count > 0 && (now - st.Hist.Peek().T).TotalSeconds > 3.2) st.Hist.Dequeue();
-
-            double dt = (now - st.T).TotalSeconds;
-            if (dt > 0.35) r.TpsInstant = Math.Max(0, (r.NDecoded - st.N) / dt);
-
-            if (st.Hist.Count > 0)
+            if (r.Processing && r.NDecoded >= 0)
             {
-                var oldest = st.Hist.Peek();
-                double dt3 = (now - oldest.T).TotalSeconds;
-                if (dt3 > 0.35) r.TpsWindow = Math.Max(0, (r.NDecoded - oldest.N) / dt3);
+                st.Hist.Enqueue(new Sample { T = now, N = r.NDecoded });
+                while (st.Hist.Count > 0 && (now - st.Hist.Peek().T).TotalSeconds > 3.2) st.Hist.Dequeue();
+                double dt = (now - st.T).TotalSeconds;
+                if (dt > 0.35) r.TpsInstant = Math.Max(0, (r.NDecoded - st.N) / dt);
+                if (st.Hist.Count > 0)
+                {
+                    var oldest = st.Hist.Peek();
+                    double dt3 = (now - oldest.T).TotalSeconds;
+                    if (dt3 > 0.35) r.TpsWindow = Math.Max(0, (r.NDecoded - oldest.N) / dt3);
+                }
             }
-            st.T = now; st.N = r.NDecoded;
-
-            long done = r.PromptProcessed + r.PromptCache;
-            if (r.PromptTotal > 0)
-            {
-                double pct = Math.Min(100.0, 100.0 * done / r.PromptTotal);
-                int bars = (int)Math.Round(pct / 5.0);
-                if (bars < 0) bars = 0;
-                if (bars > 20) bars = 20;
-                var sb = new StringBuilder();
-                sb.Append(pct.ToString("0.0", CultureInfo.InvariantCulture).PadLeft(5));
-                sb.Append("% [");
-                sb.Append(new string('#', bars));
-                sb.Append(new string('.', 20 - bars));
-                sb.Append(']');
-                r.ProgressText = sb.ToString();
-                double cachePct = 100.0 * r.PromptCache / r.PromptTotal;
-                r.PromptText = done.ToString("N0", CultureInfo.InvariantCulture) + "/"
-                    + r.PromptTotal.ToString("N0", CultureInfo.InvariantCulture)
-                    + UiText.F("CachePercent", cachePct.ToString("0.0", CultureInfo.InvariantCulture));
-            }
-
-            if (r.NCtx > 0)
-            {
-                double pct = 100.0 * r.NPast / r.NCtx;
-                r.ContextText = r.NPast.ToString("N0", CultureInfo.InvariantCulture) + "/"
-                    + r.NCtx.ToString("N0", CultureInfo.InvariantCulture)
-                    + " (" + pct.ToString("0.0", CultureInfo.InvariantCulture) + "%)";
-            }            return r;
+            else st.Hist.Clear();
+            st.T = now; st.N = r.NDecoded; st.Task = r.Task;
+            return r;
         }
-
         private static bool RowsEqual(List<SlotRow> a, List<SlotRow> b)
         {
             if (a == null || b == null || a.Count != b.Count) return false;
@@ -1369,13 +1445,13 @@ namespace LlamaMonitor
                 row.Tag = r;   // 颜色交给 CellFormatting 统一决定
 
                 DirectSet(row, 0, r.Id.ToString(CultureInfo.InvariantCulture));
-                DirectSet(row, 1, r.Task > 0 ? r.Task.ToString(CultureInfo.InvariantCulture) : "—");
+                DirectSet(row, 1, r.Task >= 0 ? r.Task.ToString(CultureInfo.InvariantCulture) : "—");
                 DirectSet(row, 2, UiText.T(r.Processing ? "Processing" : "Idle"));
                 DirectSet(row, 3, r.ProgressText);
                 DirectSet(row, 4, r.PromptText);
-                DirectSet(row, 5, r.NDecoded > 0 ? r.NDecoded.ToString("N0", CultureInfo.InvariantCulture) : "—");
-                DirectSet(row, 6, r.NDecoded > 0 ? Fmt(r.TpsInstant) : "—");
-                DirectSet(row, 7, r.NDecoded > 0 ? Fmt(r.TpsWindow) : "—");
+                DirectSet(row, 5, SlotMetrics.Count(r.NDecoded));
+                DirectSet(row, 6, r.Processing && r.NDecoded >= 0 ? Fmt(r.TpsInstant) : "—");
+                DirectSet(row, 7, r.Processing && r.NDecoded >= 0 ? Fmt(r.TpsWindow) : "—");
                 DirectSet(row, 8, r.ContextText);
             }
             _gridSlot.ResumeLayout();
@@ -1462,10 +1538,10 @@ namespace LlamaMonitor
                 return;
             }
             long pool = AsLong(_kvGuard, "pool_tokens");
-            double pct = pool > 0 ? 100.0 * used / pool : 0;
-            SetText(_lblKv, UiText.F("KvPool", used.ToString("N0", CultureInfo.InvariantCulture),
+            double pct = pool > 0 && used >= 0 ? 100.0 * used / pool : double.NaN;
+            SetText(_lblKv, UiText.F("KvPool", SlotMetrics.Count(used),
                 pool.ToString("N0", CultureInfo.InvariantCulture),
-                pct.ToString("0.0", CultureInfo.InvariantCulture),
+                double.IsNaN(pct) ? "—" : pct.ToString("0.0", CultureInfo.InvariantCulture),
                 AsString(_kvGuard, "safety_tokens"), AsString(_kvGuard, "default_output_tokens"),
                 AsString(_kvGuard, "policy")));
             SetColor(_lblKv, pct > 85 ? CBad : (pct > 65 ? CWarn : CFg));
@@ -1479,14 +1555,13 @@ namespace LlamaMonitor
 
         /// <summary>
         /// 日志框渲染。
-        /// 只追加新行、不整段重写（避免闪烁）；但用 .Text 赋值而不是 AppendText——
-        /// AppendText 在这种「Dock=Fill + 表格布局」里的 TextBox 上不触发重绘，
-        /// 会出现「内容有、画面空」的情况。缓冲区自己封顶，所以 .Text 赋的是定长文本。
+        /// Buffer is bounded; replacement preserves the reader's viewport and selection.
+        /// Follow new lines only when already at the bottom (or after a log switch).
         /// </summary>
         private void RenderTail(DateTime now)
         {
-            if (_totalLogLines - _shownLines <= 0) return;
-            if ((now - _lastTailAt).TotalSeconds < 0.9) return;
+            if (_totalLogLines - _shownLines <= 0 && !_resetLogView) return;
+            if ((now - _lastTailAt).TotalSeconds < 0.9 && !_resetLogView) return;
 
             int newCount = (int)Math.Min(_totalLogLines - _shownLines, _tail.Count);
             for (int i = _tail.Count - newCount; i < _tail.Count; i++)
@@ -1494,17 +1569,19 @@ namespace LlamaMonitor
             _shownLines = _totalLogLines;
 
             // 缓冲区封顶，超出就砍掉前面的（保持最近 400 行左右）
+            int removedChars = 0;
             if (_logBuf.Length > 36000)
             {
                 string s = _logBuf.ToString();
                 int cut = s.Length - 24000;
                 int nl = s.IndexOf('\n', cut);
-                if (nl >= 0) s = s.Substring(nl + 1);
+                if (nl >= 0) { removedChars = nl + 1; s = s.Substring(removedChars); }
                 _logBuf.Length = 0;
                 _logBuf.Append(s);
             }
 
-            _txtTail.Text = _logBuf.ToString();
+            _txtTail.ReplaceLogText(_logBuf.ToString(), removedChars, _resetLogView);
+            _resetLogView = false;
             _lastTailAt = now;
         }
 
@@ -1560,6 +1637,11 @@ namespace LlamaMonitor
                 // 文件被截断：从头读，并重置「已显示」计数，否则差值变负会永久卡住
                 _logPos = 0;
                 _shownLines = 0;
+                _totalLogLines = 0;
+                _tail.Clear();
+                _logBuf.Length = 0;
+                _resetLogView = true;
+                _tasks.Clear();
             }
             if (fi.Length == _logPos) return;
 
@@ -1650,6 +1732,8 @@ namespace LlamaMonitor
             _totalLogLines = 0;
             _shownLines = 0;
             _logBuf.Length = 0;
+            _tail.Clear();
+            _resetLogView = true;
 
             // 换了日志文件，之前那份统计出来的任务行就失效了，清掉
             _tasks.Clear();
